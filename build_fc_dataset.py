@@ -1,10 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 FC(84x84 DKT Combined, ses-t0)를 구조 morphometry CSV와 동일한 레이아웃으로 병합한다.
-두 해상도를 모두 만들어 두고 노트북에서 골라 쓴다.
+여러 해상도를 모두 만들어 두고 노트북에서 골라 쓴다.
 
 출력 1: fc_strength_68_16.csv     (44 x 91)   ROI별 node strength 84개
 출력 2: fc_full_84x84_edited.csv  (44 x 3493) 상삼각 edge 3486개 전부
+출력 3: fc_strength_68.csv        (44 x 75)   cortical 68 안에서만 계산한 strength
+출력 4: fc_full_68x68.csv         (44 x 2285) cortical 68 상삼각 edge 2278개
+
+출력 3, 4는 MSN(build_msn_dataset.py)과 짝을 맞추기 위한 것이다. MSN은 표면 측정치가
+있는 피질에서만 정의되므로 두 모달리티를 ROI 단위로 대응시키려면 FC도 68로 잘라야 한다.
+출력 3의 strength는 피질 67개 파트너의 평균이라, 피질하 16개와의 edge까지 평균에 들어간
+출력 1의 피질 컬럼과 값이 다르다. 출력 4는 출력 2에서 피질-피질 edge만 고른 것과 같다.
 
 둘 다 앞 7개 컬럼이 rid, treatment_group, vas_t0, vas_t1, age, sex, mean_fd라
 구조 CSV(structural_full_68_68_16_edited.csv)와 똑같이 index 7부터 뇌 피처가 시작한다.
@@ -43,6 +50,8 @@ FMRIPREP_DIR = r"D:\SUDMEX\fmriprep_output"
 CLIN_CSV = "structural_full_68_68_16_edited.csv"
 OUT_STRENGTH = "fc_strength_68_16.csv"
 OUT_EDGES = "fc_full_84x84_edited.csv"
+OUT_STRENGTH_CORT = "fc_strength_68.csv"
+OUT_EDGES_CORT = "fc_full_68x68.csv"
 SESSION = "ses-t0"
 
 # 구조 CSV에서 가져올 임상 컬럼. eTIV는 FC와 무관하므로 빼고 mean_fd를 뒤에 붙인다.
@@ -106,6 +115,22 @@ def mean_fd(rid):
     return float(np.nanmean(fd))
 
 
+def strength_and_edges(z, names):
+    """(n_sub, R, R) Fisher z 행렬 -> (strength, strength 이름, edge, edge 이름).
+
+    strength: 대각을 0으로 두고 나머지 R-1개 파트너의 평균
+    edge: 상삼각(대각 제외)만 취해 중복 제거
+    """
+    n_roi = z.shape[1]
+    zs = z.copy()
+    zs[:, np.arange(n_roi), np.arange(n_roi)] = 0.0
+    strengths = zs.sum(axis=2) / (n_roi - 1)
+    iu = np.triu_indices(n_roi, k=1)
+    edges = z[:, iu[0], iu[1]]
+    return (strengths, [f"{n}_fc" for n in names],
+            edges, [f"{names[i]}__{names[j]}" for i, j in zip(*iu)])
+
+
 def main():
     clin = pd.read_csv(CLIN_CSV, skipinitialspace=True)
     clin.columns = clin.columns.str.strip()
@@ -145,17 +170,15 @@ def main():
         raise RuntimeError("비유한 값 존재")
 
     n_sub, n_roi = z.shape[0], z.shape[1]
+    n_sub_roi = sum(1 for n in names if n.split("_", 1)[1] in SUBCORT)
+    n_cort = n_roi - n_sub_roi
+    # 재정렬로 피질이 앞쪽에 모여 있어야 z[:, :68, :68]이 곧 피질 블록이 된다.
+    if any(n.split("_", 1)[1] in SUBCORT for n in names[:n_cort]):
+        raise RuntimeError("피질 ROI가 앞쪽에 연속으로 모여 있지 않음")
 
-    # strength: 대각을 0으로 두고 나머지 83개 파트너의 평균
-    zs = z.copy()
-    zs[:, np.arange(n_roi), np.arange(n_roi)] = 0.0
-    strengths = zs.sum(axis=2) / (n_roi - 1)
-    strength_names = [f"{n}_fc" for n in names]
-
-    # edge: 상삼각(대각 제외)만 취해 중복 제거
-    iu = np.triu_indices(n_roi, k=1)
-    edges = z[:, iu[0], iu[1]]
-    edge_names = [f"{names[i]}__{names[j]}" for i, j in zip(*iu)]
+    strengths, strength_names, edges, edge_names = strength_and_edges(z, names)
+    c_strengths, c_strength_names, c_edges, c_edge_names = strength_and_edges(
+        z[:, :n_cort, :n_cort], names[:n_cort])
 
     motion = pd.DataFrame({"rid": rids, "mean_fd": fds})
 
@@ -168,10 +191,11 @@ def main():
         print(f"  {path:28s} {out.shape[0]:3d} x {out.shape[1]:<5d} "
               f"(임상 7 + {what} {len(colnames)})")
 
-    n_sub_roi = sum(1 for n in names if n.split("_", 1)[1] in SUBCORT)
-    print(f"\n저장 ({n_sub}명, ROI {len(names)-n_sub_roi} cortical + {n_sub_roi} subcortical):")
+    print(f"\n저장 ({n_sub}명, ROI {n_cort} cortical + {n_sub_roi} subcortical):")
     save(strengths, strength_names, OUT_STRENGTH, "strength")
     save(edges, edge_names, OUT_EDGES, "edge")
+    save(c_strengths, c_strength_names, OUT_STRENGTH_CORT, "cortical strength")
+    save(c_edges, c_edge_names, OUT_EDGES_CORT, "cortical edge")
     print(f"\n  strength 첫/끝 : {strength_names[0]} / {strength_names[-1]}")
     print(f"  edge 첫/끝     : {edge_names[0]} / {edge_names[-1]}")
 
